@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+University Confessions Bot
+- Python 3.10+
+- Uses python-telegram-bot v20+ (async)
+- Single-file for quick start; uses sqlite for storage
+"""
+
+import os
+import re
+import sqlite3
+import logging
+import time
+from datetime import datetime
+from typing import Optional, List
+from dotenv import load_dotenv
+
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+)
+
+# ---- Load config ----
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@wru_confession")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS: List[int] = [int(x) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
+AUTO_POST = os.getenv("AUTO_POST", "false").lower() == "true"
+RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", "45"))
+DB_PATH = os.getenv("DB_PATH", "confessions.db")
+
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN environment variable is required in .env")
+
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ---- DB helpers ----
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        content TEXT,
+        media_file_id TEXT,
+        media_type TEXT,
+        created_at TEXT,
+        status TEXT,
+        admin_note TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS rate_limit (
+        user_id INTEGER PRIMARY KEY,
+        last_ts INTEGER
+    )""")
+    conn.commit()
+    conn.close()
+
+def save_submission(user_id: int, content: Optional[str], media_file_id: Optional[str], media_type: Optional[str]) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO submissions (user_id, content, media_file_id, media_type, created_at, status) VALUES (?,?,?,?,?,?)",
+              (user_id, content, media_file_id, media_type, datetime.utcnow().isoformat(), "PENDING"))
+    sid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return sid
+
+def list_pending(limit: int = 50):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, content, media_file_id, media_type, created_at FROM submissions WHERE status='PENDING' ORDER BY id DESC LIMIT ?",
+              (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_submission(sid: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, content, media_file_id, media_type, created_at, status FROM submissions WHERE id=?", (sid,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def set_status(sid: int, status: str, admin_note: Optional[str] = None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE submissions SET status=?, admin_note=? WHERE id=?", (status, admin_note, sid))
+    conn.commit()
+    conn.close()
+
+# ---- Rate limiting ----
+def allowed_to_submit(user_id: int) -> bool:
+    now = int(time.time())
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT last_ts FROM rate_limit WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if row is None:
+        c.execute("INSERT OR REPLACE INTO rate_limit (user_id, last_ts) VALUES (?,?)", (user_id, now))
+        conn.commit()
+        conn.close()
+        return True
+    last = row[0]
+    if now - last < RATE_LIMIT_SECONDS:
+        conn.close()
+        return False
+    c.execute("UPDATE rate_limit SET last_ts=? WHERE user_id=?", (now, user_id))
+    conn.commit()
+    conn.close()
+    return True
+
+# ---- Content filters (simple, extend as needed) ----
+URL_RE = re.compile(r"https?://", re.IGNORECASE)
+PROFANITY = {"badword1", "badword2"}
+
+def contains_profanity(text: str) -> bool:
+    low = text.lower()
+    for w in PROFANITY:
+        if w in low:
+            return True
+    return False
+
+# ---- Bot handlers ----
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Welcome to University Confessions — send your message (text or photo). It will be posted anonymously after review."
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "How to use:\n- Send a text or photo privately to me.\n- Admins will review and approve it for posting.\nAdmin commands (admins only): /pending, /approve <id>, /reject <id>, /stats"
+    )
+
+async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    user = update.effective_user
+    uid = user.id
+    if not allowed_to_submit(uid):
+        await msg.reply_text("You're sending too quickly — please wait a moment before submitting again.")
+        return
+
+    text = (msg.text or "").strip()
+    media_file_id = None
+    media_type = None
+    if msg.photo:
+        media_file_id = msg.photo[-1].file_id
+        media_type = "photo"
+    elif msg.document:
+        media_file_id = msg.document.file_id
+        media_type = "document"
+
+    if not text and not media_file_id:
+        await msg.reply_text("Please send a text message or a photo/document as your confession.")
+        return
+
+    if text and URL_RE.search(text):
+        await msg.reply_text("Links are not allowed in confessions.")
+        return
+    if text and contains_profanity(text):
+        await msg.reply_text("Your message appears to contain disallowed words.")
+        return
+
+    sid = save_submission(uid, text if text else None, media_file_id, media_type)
+    note = f"New submission #{sid}"
+    for aid in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=aid, text=f"{note}\nUse /approve {sid} or /reject {sid}\nPreview:\n{(text[:400]+'...') if text and len(text)>400 else (text or '[media]')}")
+        except Exception as e:
+            logger.warning("Failed to notify admin %s: %s", aid, e)
+
+    if AUTO_POST:
+        await post_submission(context, sid)
+        await msg.reply_text("Your confession was posted anonymously.")
+    else:
+        await msg.reply_text("Thanks — your confession has been queued for review by admins.")
+
+async def post_submission(context: ContextTypes.DEFAULT_TYPE, sid: int):
+    row = get_submission(sid)
+    if not row:
+        return
+    _, _, content, media_file_id, media_type, created_at, status = row
+    post_text = f"#{sid}\n"
+    if content:
+        post_text += content + "\n\n"
+    post_text += "— Anonymous"
+    try:
+        if media_file_id and media_type == "photo":
+            await context.bot.send_photo(chat_id=TARGET_CHANNEL, photo=media_file_id, caption=post_text)
+        elif media_file_id and media_type == "document":
+            await context.bot.send_document(chat_id=TARGET_CHANNEL, document=media_file_id, caption=post_text)
+        else:
+            await context.bot.send_message(chat_id=TARGET_CHANNEL, text=post_text)
+        set_status(sid, "POSTED")
+    except Exception as e:
+        logger.exception("Failed to post submission %s: %s", sid, e)
+        set_status(sid, "ERROR", admin_note=str(e))
+
+# ---- Admin commands ----
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized.")
+        return
+    rows = list_pending(30)
+    if not rows:
+        await update.message.reply_text("No pending submissions.")
+        return
+    text_lines = []
+    for r in rows:
+        sid, content, media_file_id, media_type, created_at = r
+        preview = (content[:200] + "...") if content and len(content) > 200 else (content or "[media]")
+        text_lines.append(f"#{sid} — {preview} ({created_at})")
+    await update.message.reply_text("\n\n".join(text_lines))
+
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /approve <id>")
+        return
+    try:
+        sid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID must be a number.")
+        return
+    set_status(sid, "APPROVED")
+    await post_submission(context, sid)
+    await update.message.reply_text(f"Submission {sid} approved & posted.")
+
+async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /reject <id> [reason]")
+        return
+    try:
+        sid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID must be a number.")
+        return
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    set_status(sid, "REJECTED", admin_note=reason)
+    await update.message.reply_text(f"Submission {sid} rejected.")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized.")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM submissions")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM submissions WHERE status='POSTED'")
+    posted = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM submissions WHERE status='PENDING'")
+    pending = c.fetchone()[0]
+    conn.close()
+    await update.message.reply_text(f"Total: {total}\nPosted: {posted}\nPending: {pending}")
+
+# ---- Main ----
+def main():
+    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("pending", pending_command))
+    app.add_handler(CommandHandler("approve", approve_command))
+    app.add_handler(CommandHandler("reject", reject_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_submission))
+
+    logger.info("Bot starting (polling)...")
+    app.run_polling(poll_interval=1.0)
+
+if __name__ == "__main__":
+    main()
