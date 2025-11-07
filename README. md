@@ -1,0 +1,8 @@
+WRU Confessions Bot
+
+Deployment Instructions:
+
+1. Open Railway on your phone: https://railway.app
+2. Click "New Project → Deploy from GitHub" → select this repo
+3. Add environment variables from .env.example
+4. Click "Deploy" → bot runs 24/7
